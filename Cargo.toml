@@ -35,6 +35,9 @@ zeroize = { version = "1.7", features = ["derive"] }
 # For colored terminal output
 colored = "2.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.10"
 

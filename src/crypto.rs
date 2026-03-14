@@ -8,12 +8,13 @@ use rand::RngCore;
 use zeroize::Zeroizing;
 
 use crate::error::{LockboxError, Result};
+use crate::memlock::mlock_slice;
 
 /// Lockbox file format magic bytes - indentifies our encrypted files
 pub const MAGIC_BYTES: &[u8; 8] = b"LOCKBOX\x01";
 
 /// Version of the file format (for future compatibility)
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 
 /// Salt length for Argon2id (16 bytes = 128 bits, recommended minimum)
 pub const SALT_LENGTH: usize = 16;
@@ -33,6 +34,25 @@ const ARGON2_MEMORY_KIB: u32 = 65536; // 64 MiB
 const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
 
+/// Argon2id key derivation parameters stored in the file header (v2+)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KdfParams {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+impl KdfParams {
+    /// Returns the current default (strongest) parameters for new encryptions
+    pub fn current() -> Self {
+        Self {
+            memory_kib: ARGON2_MEMORY_KIB,
+            iterations: ARGON2_ITERATIONS,
+            parallelism: ARGON2_PARALLELISM,
+        }
+    }
+}
+
 /// Derives a 256-bit encryption key from a password using Argon2id
 ///
 /// Argon2id is the recommended password hashing algorithm, combining:
@@ -40,14 +60,18 @@ const ARGON2_PARALLELISM: u32 = 4;
 /// - Argon2d: resistance against GPU cracking attacks
 ///
 /// The salt ensures that the same password produces different keys for different files.
+///
+/// The derived key is memory-locked (best-effort) to prevent it from being swapped to disk.
+/// Callers should be aware that the returned key occupies mlocked memory.
 pub fn derive_key_from_password(
     password: &[u8],
     salt: &[u8],
+    kdf_params: &KdfParams,
 ) -> Result<Zeroizing<[u8; KEY_LENGTH]>> {
     let params = Params::new(
-        ARGON2_MEMORY_KIB,
-        ARGON2_ITERATIONS,
-        ARGON2_PARALLELISM,
+        kdf_params.memory_kib,
+        kdf_params.iterations,
+        kdf_params.parallelism,
         Some(KEY_LENGTH),
     )
     .map_err(|e| LockboxError::EncryptionFailed(format!("Invalid Argon2 params: {}", e)))?;
@@ -58,6 +82,10 @@ pub fn derive_key_from_password(
     argon2
         .hash_password_into(password, salt, key.as_mut())
         .map_err(|e| LockboxError::EncryptionFailed(format!("Key derivation failed: {}", e)))?;
+
+    // Best-effort mlock to prevent the key from being swapped to disk.
+    // Failures are silently ignored (e.g., due to RLIMIT_MEMLOCK).
+    mlock_slice(key.as_ref());
 
     Ok(key)
 }
@@ -123,27 +151,55 @@ pub fn decrypt(
 
 // Encrypted file structure:
 //
+// Version 1 (legacy):
 // | Offset | Size | Description                          |
 // |--------|------|--------------------------------------|
 // | 0      | 8    | Magic bytes "LOCKBOX\x01"            |
-// | 8      | 1    | Format version (currently 1)         |
+// | 8      | 1    | Format version (1)                   |
 // | 9      | 2    | Original filename length (u16 BE)    |
 // | 11     | N    | Original filename (UTF-8)            |
 // | 11+N   | 16   | Argon2id salt                        |
 // | 27+N   | 12   | ChaCha20 nonce                       |
 // | 39+N   | ...  | Encrypted data + auth tag (16 bytes) |
 //
-// Total header size before encrypted data: 39 + filename_length bytes
+// Version 2 (current):
+// | Offset | Size | Description                          |
+// |--------|------|--------------------------------------|
+// | 0      | 8    | Magic bytes "LOCKBOX\x01"            |
+// | 8      | 1    | Format version (2)                   |
+// | 9      | 4    | Argon2 memory cost (u32 BE, in KiB)  |
+// | 13     | 4    | Argon2 iterations (u32 BE)           |
+// | 17     | 4    | Argon2 parallelism (u32 BE)          |
+// | 21     | 2    | Original filename length (u16 BE)    |
+// | 23     | N    | Original filename (UTF-8)            |
+// | 23+N   | 16   | Argon2id salt                        |
+// | 39+N   | 12   | ChaCha20 nonce                       |
+// | 51+N   | ...  | Encrypted data + auth tag (16 bytes) |
 
-/// Creates the encrypted file format with all metadata
+/// Creates the encrypted file format with all metadata using default KDF params
 pub fn create_encrypted_file(
     password: &[u8],
     original_filename: &str,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    create_encrypted_file_with_params(
+        password,
+        original_filename,
+        plaintext,
+        &KdfParams::current(),
+    )
+}
+
+/// Creates the encrypted file format with all metadata using the specified KDF params
+pub fn create_encrypted_file_with_params(
+    password: &[u8],
+    original_filename: &str,
+    plaintext: &[u8],
+    kdf_params: &KdfParams,
+) -> Result<Vec<u8>> {
     let salt = generate_salt();
     let nonce = generate_nonce();
-    let key = derive_key_from_password(password, &salt)?;
+    let key = derive_key_from_password(password, &salt, kdf_params)?;
     let ciphertext = encrypt(&key, &nonce, plaintext)?;
 
     // Build the file structure
@@ -157,6 +213,9 @@ pub fn create_encrypted_file(
     let mut output = Vec::with_capacity(
         MAGIC_BYTES.len()
             + 1 // version
+            + 4 // memory cost
+            + 4 // iterations
+            + 4 // parallelism
             + 2 // filename length
             + filename_bytes.len()
             + SALT_LENGTH
@@ -167,6 +226,9 @@ pub fn create_encrypted_file(
     // Write header
     output.extend_from_slice(MAGIC_BYTES);
     output.push(FORMAT_VERSION);
+    output.extend_from_slice(&kdf_params.memory_kib.to_be_bytes());
+    output.extend_from_slice(&kdf_params.iterations.to_be_bytes());
+    output.extend_from_slice(&kdf_params.parallelism.to_be_bytes());
     output.extend_from_slice(&filename_len.to_be_bytes());
     output.extend_from_slice(filename_bytes);
     output.extend_from_slice(&salt);
@@ -178,12 +240,18 @@ pub fn create_encrypted_file(
 
 /// Parses an encrypted file and decrypts its contents
 ///
+/// Supports both version 1 (legacy) and version 2 (current) file formats.
+/// - Version 1: uses hardcoded KDF params (64 MiB, 3 iterations, 4 parallelism)
+/// - Version 2: reads KDF params from the file header
+///
 /// Returns: (original_filename, decrypted_data)
 pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, Vec<u8>)> {
-    // Minimum size: magic(8) + version(1) + filename_len(2) + salt(16) + nonce(12) + tag(16)
-    const MINIMUM_SIZE: usize = 8 + 1 + 2 + 16 + 12 + 16;
+    // Minimum size for v1: magic(8) + version(1) + filename_len(2) + salt(16) + nonce(12) + tag(16) = 55
+    const MINIMUM_SIZE_V1: usize = 8 + 1 + 2 + 16 + 12 + 16;
+    // Minimum size for v2: magic(8) + version(1) + kdf(12) + filename_len(2) + salt(16) + nonce(12) + tag(16) = 67
+    const MINIMUM_SIZE_V2: usize = 8 + 1 + 12 + 2 + 16 + 12 + 16;
 
-    if encrypted_data.len() < MINIMUM_SIZE {
+    if encrypted_data.len() < MINIMUM_SIZE_V1 {
         return Err(LockboxError::InvalidFileFormat);
     }
 
@@ -194,15 +262,55 @@ pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, V
 
     // Check version
     let version = encrypted_data[8];
-    if version != FORMAT_VERSION {
-        return Err(LockboxError::InvalidFileFormat);
-    }
+
+    let (kdf_params, filename_len_offset) = match version {
+        1 => {
+            // Version 1: use hardcoded v1 params
+            let kdf = KdfParams {
+                memory_kib: ARGON2_MEMORY_KIB,
+                iterations: ARGON2_ITERATIONS,
+                parallelism: ARGON2_PARALLELISM,
+            };
+            (kdf, 9usize)
+        }
+        2 => {
+            // Version 2: read KDF params from header
+            if encrypted_data.len() < MINIMUM_SIZE_V2 {
+                return Err(LockboxError::InvalidFileFormat);
+            }
+            let memory_kib = u32::from_be_bytes(
+                encrypted_data[9..13]
+                    .try_into()
+                    .map_err(|_| LockboxError::InvalidFileFormat)?,
+            );
+            let iterations = u32::from_be_bytes(
+                encrypted_data[13..17]
+                    .try_into()
+                    .map_err(|_| LockboxError::InvalidFileFormat)?,
+            );
+            let parallelism = u32::from_be_bytes(
+                encrypted_data[17..21]
+                    .try_into()
+                    .map_err(|_| LockboxError::InvalidFileFormat)?,
+            );
+            let kdf = KdfParams {
+                memory_kib,
+                iterations,
+                parallelism,
+            };
+            (kdf, 21usize)
+        }
+        _ => return Err(LockboxError::InvalidFileFormat),
+    };
 
     // Read filename length
-    let filename_len = u16::from_be_bytes([encrypted_data[9], encrypted_data[10]]) as usize;
+    let filename_len = u16::from_be_bytes([
+        encrypted_data[filename_len_offset],
+        encrypted_data[filename_len_offset + 1],
+    ]) as usize;
 
     // Calculate offsets
-    let filename_start = 11;
+    let filename_start = filename_len_offset + 2;
     let filename_end = filename_start + filename_len;
     let salt_start = filename_end;
     let salt_end = salt_start + SALT_LENGTH;
@@ -231,7 +339,7 @@ pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, V
     let ciphertext = &encrypted_data[ciphertext_start..];
 
     // Derive key and decrypt
-    let key = derive_key_from_password(password, &salt)?;
+    let key = derive_key_from_password(password, &salt, &kdf_params)?;
     let plaintext = decrypt(&key, &nonce, ciphertext)?;
 
     Ok((original_filename, plaintext))
@@ -248,8 +356,8 @@ mod tests {
         let password = b"test_password";
         let salt = [0u8; SALT_LENGTH];
 
-        let key1 = derive_key_from_password(password, &salt).unwrap();
-        let key2 = derive_key_from_password(password, &salt).unwrap();
+        let key1 = derive_key_from_password(password, &salt, &KdfParams::current()).unwrap();
+        let key2 = derive_key_from_password(password, &salt, &KdfParams::current()).unwrap();
 
         assert_eq!(
             *key1, *key2,
@@ -263,8 +371,8 @@ mod tests {
         let salt1 = [0u8; SALT_LENGTH];
         let salt2 = [1u8; SALT_LENGTH];
 
-        let key1 = derive_key_from_password(password, &salt1).unwrap();
-        let key2 = derive_key_from_password(password, &salt2).unwrap();
+        let key1 = derive_key_from_password(password, &salt1, &KdfParams::current()).unwrap();
+        let key2 = derive_key_from_password(password, &salt2, &KdfParams::current()).unwrap();
 
         assert_ne!(
             *key1, *key2,
@@ -275,8 +383,8 @@ mod tests {
     #[test]
     fn test_derive_key_different_passwords() {
         let salt = [0u8; SALT_LENGTH];
-        let key1 = derive_key_from_password(b"password1", &salt).unwrap();
-        let key2 = derive_key_from_password(b"password2", &salt).unwrap();
+        let key1 = derive_key_from_password(b"password1", &salt, &KdfParams::current()).unwrap();
+        let key2 = derive_key_from_password(b"password2", &salt, &KdfParams::current()).unwrap();
 
         assert_ne!(
             *key1, *key2,
@@ -287,7 +395,7 @@ mod tests {
     #[test]
     fn test_derive_key_empty_password() {
         let salt = [0u8; SALT_LENGTH];
-        let result = derive_key_from_password(b"", &salt);
+        let result = derive_key_from_password(b"", &salt, &KdfParams::current());
         assert!(result.is_ok(), "Empty password should still derive a key");
     }
 
@@ -295,7 +403,7 @@ mod tests {
     fn test_derive_key_length() {
         let password = b"test";
         let salt = [0u8; SALT_LENGTH];
-        let key = derive_key_from_password(password, &salt).unwrap();
+        let key = derive_key_from_password(password, &salt, &KdfParams::current()).unwrap();
 
         assert_eq!(
             key.len(),
@@ -581,12 +689,24 @@ mod tests {
         // Verify version
         assert_eq!(encrypted[8], FORMAT_VERSION);
 
+        // Verify KDF params (v2 format)
+        let kdf = KdfParams::current();
+        let memory =
+            u32::from_be_bytes([encrypted[9], encrypted[10], encrypted[11], encrypted[12]]);
+        assert_eq!(memory, kdf.memory_kib);
+        let iterations =
+            u32::from_be_bytes([encrypted[13], encrypted[14], encrypted[15], encrypted[16]]);
+        assert_eq!(iterations, kdf.iterations);
+        let parallelism =
+            u32::from_be_bytes([encrypted[17], encrypted[18], encrypted[19], encrypted[20]]);
+        assert_eq!(parallelism, kdf.parallelism);
+
         // Verify filename length (big-endian u16)
-        let filename_len = u16::from_be_bytes([encrypted[9], encrypted[10]]) as usize;
+        let filename_len = u16::from_be_bytes([encrypted[21], encrypted[22]]) as usize;
         assert_eq!(filename_len, filename.len());
 
         // Verify filename
-        let stored_filename = std::str::from_utf8(&encrypted[11..11 + filename_len]).unwrap();
+        let stored_filename = std::str::from_utf8(&encrypted[23..23 + filename_len]).unwrap();
         assert_eq!(stored_filename, filename);
     }
 
@@ -611,8 +731,8 @@ mod tests {
 
         let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
 
-        // Corrupt the salt area (after magic + version + filename_len + filename)
-        let salt_offset = 11 + filename.len();
+        // Corrupt the salt area (v2: after magic + version + kdf(12) + filename_len(2) + filename)
+        let salt_offset = 23 + filename.len();
         encrypted[salt_offset] ^= 0xFF;
 
         let result = decrypt_file(password, &encrypted);
@@ -627,8 +747,8 @@ mod tests {
 
         let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
 
-        // Corrupt the nonce area
-        let nonce_offset = 11 + filename.len() + SALT_LENGTH;
+        // Corrupt the nonce area (v2: after salt)
+        let nonce_offset = 23 + filename.len() + SALT_LENGTH;
         encrypted[nonce_offset] ^= 0xFF;
 
         let result = decrypt_file(password, &encrypted);
@@ -698,10 +818,10 @@ mod tests {
 
         let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
 
-        // Overwrite filename length with a huge value (e.g., 60000)
+        // Overwrite filename length with a huge value (v2: offset 21)
         let fake_len: u16 = 60000;
-        encrypted[9] = fake_len.to_be_bytes()[0];
-        encrypted[10] = fake_len.to_be_bytes()[1];
+        encrypted[21] = fake_len.to_be_bytes()[0];
+        encrypted[22] = fake_len.to_be_bytes()[1];
 
         let result = decrypt_file(password, &encrypted);
         assert!(
@@ -712,11 +832,12 @@ mod tests {
 
     #[test]
     fn test_non_utf8_filename_in_encrypted_data() {
-        // Manually construct encrypted data with invalid UTF-8 in the filename field
+        // Manually construct encrypted data with invalid UTF-8 in the filename field (v2 format)
         let password = b"password";
+        let kdf = KdfParams::current();
         let salt = [0u8; SALT_LENGTH];
         let nonce = [0u8; NONCE_LENGTH];
-        let key = derive_key_from_password(password, &salt).unwrap();
+        let key = derive_key_from_password(password, &salt, &kdf).unwrap();
         let ciphertext = encrypt(&key, &nonce, b"data").unwrap();
 
         let invalid_utf8_filename: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
@@ -724,6 +845,9 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC_BYTES);
         data.push(FORMAT_VERSION);
+        data.extend_from_slice(&kdf.memory_kib.to_be_bytes());
+        data.extend_from_slice(&kdf.iterations.to_be_bytes());
+        data.extend_from_slice(&kdf.parallelism.to_be_bytes());
         data.extend_from_slice(&(invalid_utf8_filename.len() as u16).to_be_bytes());
         data.extend_from_slice(invalid_utf8_filename);
         data.extend_from_slice(&salt);
@@ -794,25 +918,27 @@ mod tests {
 
     #[test]
     fn test_file_exactly_minimum_size_but_invalid() {
-        // Construct data that is exactly the minimum size (55 bytes for empty filename)
+        // Construct data that is exactly the v2 minimum size (67 bytes for empty filename)
         // but has valid magic/version so it reaches the decrypt stage and fails auth
-        let min_size: usize = 8 + 1 + 2 + 16 + 12 + 16; // 55
+        let min_size: usize = 8 + 1 + 12 + 2 + 16 + 12 + 16; // 67
         let mut data = vec![0u8; min_size];
         data[..8].copy_from_slice(MAGIC_BYTES);
         data[8] = FORMAT_VERSION;
-        // filename_len = 0 (already zeroed)
+        // KDF params and filename_len = 0 (already zeroed)
 
         let result = decrypt_file(b"password", &data);
-        // Should fail at decryption (wrong key) not at parsing
+        // Should fail at decryption (wrong key / zero KDF params) not at parsing
+        // Note: zero KDF params (0 memory, 0 iterations, 0 parallelism) will cause
+        // an Argon2 param error, which surfaces as EncryptionFailed
         assert!(
-            matches!(result, Err(LockboxError::DecryptionFailed)),
-            "Minimum-size file with valid header should fail at decryption, not parsing"
+            result.is_err(),
+            "Minimum-size file with valid header should fail"
         );
     }
 
     #[test]
     fn test_file_one_byte_below_minimum_size() {
-        let min_size: usize = 8 + 1 + 2 + 16 + 12 + 16;
+        let min_size: usize = 8 + 1 + 12 + 2 + 16 + 12 + 16; // 67
         let mut data = vec![0u8; min_size - 1];
         data[..8].copy_from_slice(MAGIC_BYTES);
         data[8] = FORMAT_VERSION;
@@ -822,5 +948,155 @@ mod tests {
             matches!(result, Err(LockboxError::InvalidFileFormat)),
             "File below minimum size should be rejected as invalid format"
         );
+    }
+
+    // ==================== Version 2 Format Tests ====================
+
+    #[test]
+    fn test_v2_format_roundtrip() {
+        let password = b"test_v2_roundtrip";
+        let plaintext = b"Version 2 format test data with some content.";
+        let filename = "v2_test.txt";
+
+        let encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+
+        // Verify it is v2
+        assert_eq!(encrypted[8], 2);
+
+        let (recovered_filename, recovered_plaintext) = decrypt_file(password, &encrypted).unwrap();
+        assert_eq!(recovered_filename, filename);
+        assert_eq!(recovered_plaintext, plaintext);
+    }
+
+    #[test]
+    fn test_v1_backward_compatibility() {
+        // Manually construct a v1-format file and verify decrypt_file can parse it
+        let password = b"v1_compat_password";
+        let filename = "legacy.txt";
+        let plaintext = b"Legacy v1 data";
+
+        // Use the v1 hardcoded KDF params to derive key
+        let v1_kdf = KdfParams {
+            memory_kib: ARGON2_MEMORY_KIB,
+            iterations: ARGON2_ITERATIONS,
+            parallelism: ARGON2_PARALLELISM,
+        };
+        let salt = generate_salt();
+        let nonce = generate_nonce();
+        let key = derive_key_from_password(password, &salt, &v1_kdf).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+
+        // Build a v1-format file manually
+        let filename_bytes = filename.as_bytes();
+        let filename_len = filename_bytes.len() as u16;
+        let mut v1_data = Vec::new();
+        v1_data.extend_from_slice(MAGIC_BYTES);
+        v1_data.push(1); // version 1
+        v1_data.extend_from_slice(&filename_len.to_be_bytes());
+        v1_data.extend_from_slice(filename_bytes);
+        v1_data.extend_from_slice(&salt);
+        v1_data.extend_from_slice(&nonce);
+        v1_data.extend_from_slice(&ciphertext);
+
+        // decrypt_file should handle v1 format
+        let (recovered_filename, recovered_plaintext) = decrypt_file(password, &v1_data).unwrap();
+        assert_eq!(recovered_filename, filename);
+        assert_eq!(recovered_plaintext, plaintext);
+    }
+
+    #[test]
+    fn test_custom_kdf_params_roundtrip() {
+        // Create an encrypted file with non-default KdfParams and verify decryption works
+        let password = b"custom_kdf_password";
+        let plaintext = b"Custom KDF params test data";
+        let filename = "custom_kdf.txt";
+
+        let custom_kdf = KdfParams {
+            memory_kib: 32768, // 32 MiB instead of 64 MiB
+            iterations: 2,     // 2 instead of 3
+            parallelism: 2,    // 2 instead of 4
+        };
+
+        let encrypted =
+            create_encrypted_file_with_params(password, filename, plaintext, &custom_kdf).unwrap();
+
+        // Verify header stores the custom params
+        let memory =
+            u32::from_be_bytes([encrypted[9], encrypted[10], encrypted[11], encrypted[12]]);
+        assert_eq!(memory, 32768);
+        let iterations =
+            u32::from_be_bytes([encrypted[13], encrypted[14], encrypted[15], encrypted[16]]);
+        assert_eq!(iterations, 2);
+        let parallelism =
+            u32::from_be_bytes([encrypted[17], encrypted[18], encrypted[19], encrypted[20]]);
+        assert_eq!(parallelism, 2);
+
+        // Decrypt should read the params from the header and succeed
+        let (recovered_filename, recovered_plaintext) = decrypt_file(password, &encrypted).unwrap();
+        assert_eq!(recovered_filename, filename);
+        assert_eq!(recovered_plaintext, plaintext);
+    }
+
+    #[test]
+    fn test_v2_encrypted_file_structure() {
+        // Verify the exact header layout of v2 files
+        let password = b"password";
+        let plaintext = b"structure test";
+        let filename = "struct.dat";
+
+        let encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+        let kdf = KdfParams::current();
+
+        // Magic bytes at offset 0..8
+        assert_eq!(&encrypted[0..8], MAGIC_BYTES);
+
+        // Version at offset 8
+        assert_eq!(encrypted[8], 2u8);
+
+        // KDF memory at offset 9..13
+        assert_eq!(
+            u32::from_be_bytes([encrypted[9], encrypted[10], encrypted[11], encrypted[12]]),
+            kdf.memory_kib
+        );
+
+        // KDF iterations at offset 13..17
+        assert_eq!(
+            u32::from_be_bytes([encrypted[13], encrypted[14], encrypted[15], encrypted[16]]),
+            kdf.iterations
+        );
+
+        // KDF parallelism at offset 17..21
+        assert_eq!(
+            u32::from_be_bytes([encrypted[17], encrypted[18], encrypted[19], encrypted[20]]),
+            kdf.parallelism
+        );
+
+        // Filename length at offset 21..23
+        let filename_len = u16::from_be_bytes([encrypted[21], encrypted[22]]) as usize;
+        assert_eq!(filename_len, filename.len());
+
+        // Filename at offset 23..23+N
+        let stored_filename = std::str::from_utf8(&encrypted[23..23 + filename_len]).unwrap();
+        assert_eq!(stored_filename, filename);
+
+        // Salt at offset 23+N..39+N (16 bytes)
+        let salt_start = 23 + filename_len;
+        assert_eq!(
+            encrypted[salt_start..salt_start + SALT_LENGTH].len(),
+            SALT_LENGTH
+        );
+
+        // Nonce at offset 39+N..51+N (12 bytes)
+        let nonce_start = salt_start + SALT_LENGTH;
+        assert_eq!(
+            encrypted[nonce_start..nonce_start + NONCE_LENGTH].len(),
+            NONCE_LENGTH
+        );
+
+        // Ciphertext + auth tag at offset 51+N..end
+        let ciphertext_start = nonce_start + NONCE_LENGTH;
+        let ciphertext_len = encrypted.len() - ciphertext_start;
+        // plaintext(14) + auth_tag(16) = 30
+        assert_eq!(ciphertext_len, plaintext.len() + 16);
     }
 }

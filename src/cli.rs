@@ -20,24 +20,30 @@ pub enum Commands {
     ///
     /// Fields will be encrypted and saved with the .lb extension.
     /// Original files are preserved (not deleted).
+    /// If no files are specified, reads from stdin and writes to stdout.
     #[command(visible_alias = "enc", visible_alias = "e")]
     Encrypt {
-        /// Files to encrypt
-        #[arg(required = true, num_args = 1..)]
+        /// Files to encrypt (reads from stdin if omitted)
+        #[arg(num_args = 0..)]
         files: Vec<PathBuf>,
 
         /// Force overwrite without prompting if output file exists
         #[arg(short, long, default_value_t = false)]
         force: bool,
+
+        /// Securely delete original files after encryption (overwrites with random data)
+        #[arg(short = 's', long, visible_alias = "delete", default_value_t = false)]
+        shred: bool,
     },
 
     /// Decrypt one or more .lb files
     ///
     /// Files will be decrypted and restored to their original format.
+    /// If no files are specified, reads from stdin and writes to stdout.
     #[command(visible_alias = "dec", visible_alias = "d")]
     Decrypt {
-        /// Files to decrypt (must have .lb extension)
-        #[arg(required = true, num_args = 1..)]
+        /// Files to decrypt (reads from stdin if omitted)
+        #[arg(num_args = 0..)]
         files: Vec<PathBuf>,
 
         /// Output directory for decrypted files (defaults to current directory)
@@ -73,10 +79,15 @@ mod tests {
         let cli = Cli::try_parse_from(["lockbox", "encrypt", "file.txt"]).unwrap();
 
         match cli.command {
-            Commands::Encrypt { files, force } => {
+            Commands::Encrypt {
+                files,
+                force,
+                shred,
+            } => {
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0], PathBuf::from("file.txt"));
                 assert!(!force);
+                assert!(!shred);
             }
             _ => panic!("Expected Encrypt command"),
         }
@@ -87,7 +98,7 @@ mod tests {
         let cli = Cli::try_parse_from(["lockbox", "encrypt", "a.txt", "b.pdf", "c.doc"]).unwrap();
 
         match cli.command {
-            Commands::Encrypt { files, force } => {
+            Commands::Encrypt { files, force, .. } => {
                 assert_eq!(files.len(), 3);
                 assert_eq!(files[0], PathBuf::from("a.txt"));
                 assert_eq!(files[1], PathBuf::from("b.pdf"));
@@ -103,7 +114,7 @@ mod tests {
         let cli = Cli::try_parse_from(["lockbox", "encrypt", "-f", "file.txt"]).unwrap();
 
         match cli.command {
-            Commands::Encrypt { files, force } => {
+            Commands::Encrypt { files, force, .. } => {
                 assert_eq!(files.len(), 1);
                 assert!(force);
             }
@@ -116,8 +127,9 @@ mod tests {
         let cli = Cli::try_parse_from(["lockbox", "encrypt", "--force", "file.txt"]).unwrap();
 
         match cli.command {
-            Commands::Encrypt { force, .. } => {
+            Commands::Encrypt { force, shred, .. } => {
                 assert!(force);
+                assert!(!shred);
             }
             _ => panic!("Expected Encrypt command"),
         }
@@ -242,15 +254,25 @@ mod tests {
     // ==================== Error Cases ====================
 
     #[test]
-    fn test_encrypt_requires_file() {
-        let result = Cli::try_parse_from(["lockbox", "encrypt"]);
-        assert!(result.is_err());
+    fn test_encrypt_no_files_is_valid() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt"]).unwrap();
+        match cli.command {
+            Commands::Encrypt { files, .. } => {
+                assert!(files.is_empty());
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
     }
 
     #[test]
-    fn test_decrypt_requires_file() {
-        let result = Cli::try_parse_from(["lockbox", "decrypt"]);
-        assert!(result.is_err());
+    fn test_decrypt_no_files_is_valid() {
+        let cli = Cli::try_parse_from(["lockbox", "decrypt"]).unwrap();
+        match cli.command {
+            Commands::Decrypt { files, .. } => {
+                assert!(files.is_empty());
+            }
+            _ => panic!("Expected Decrypt command"),
+        }
     }
 
     #[test]
@@ -303,12 +325,75 @@ mod tests {
         }
     }
 
+    // ==================== Shred Flag Tests ====================
+
+    #[test]
+    fn test_encrypt_with_shred_short() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "-s", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { shred, .. } => {
+                assert!(shred);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_with_shred_long() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "--shred", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { shred, .. } => {
+                assert!(shred);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_with_delete_alias() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "--delete", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { shred, .. } => {
+                assert!(shred);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_shred_defaults_to_false() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { shred, .. } => {
+                assert!(!shred);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_with_shred_and_force() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "-f", "-s", "file.txt"]).unwrap();
+
+        match cli.command {
+            Commands::Encrypt { force, shred, .. } => {
+                assert!(force);
+                assert!(shred);
+            }
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
     #[test]
     fn test_mixed_flags_and_files() {
         // Force flag before files
         let cli1 = Cli::try_parse_from(["lockbox", "encrypt", "-f", "a.txt", "b.txt"]).unwrap();
         match cli1.command {
-            Commands::Encrypt { files, force } => {
+            Commands::Encrypt { files, force, .. } => {
                 assert_eq!(files.len(), 2);
                 assert!(force);
             }
@@ -318,7 +403,7 @@ mod tests {
         // Force flag after files
         let cli2 = Cli::try_parse_from(["lockbox", "encrypt", "a.txt", "b.txt", "-f"]).unwrap();
         match cli2.command {
-            Commands::Encrypt { files, force } => {
+            Commands::Encrypt { files, force, .. } => {
                 assert_eq!(files.len(), 2);
                 assert!(force);
             }

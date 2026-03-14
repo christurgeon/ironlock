@@ -1,6 +1,9 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 use crate::crypto::{create_encrypted_file, decrypt_file};
 use crate::error::{LockboxError, Result};
@@ -39,20 +42,64 @@ pub fn check_overwrite(path: &Path, force: bool) -> Result<()> {
     }
 }
 
+/// Securely deletes a file by overwriting it with random data before removing it.
+///
+/// Performs 3 passes of cryptographically random data overwrites, flushing and
+/// syncing to disk after each pass, then deletes the file.
+pub fn secure_delete(path: &Path) -> Result<()> {
+    use std::io::Seek;
+
+    let file_size = fs::metadata(path)
+        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to read metadata: {}", e)))?
+        .len() as usize;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to open file: {}", e)))?;
+
+    let mut random_data = vec![0u8; file_size];
+
+    for _ in 0..3 {
+        OsRng.fill_bytes(&mut random_data);
+
+        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+            LockboxError::SecureDeletionFailed(format!("failed to seek file: {}", e))
+        })?;
+
+        file.write_all(&random_data).map_err(|e| {
+            LockboxError::SecureDeletionFailed(format!("failed to overwrite file: {}", e))
+        })?;
+
+        file.flush().map_err(|e| {
+            LockboxError::SecureDeletionFailed(format!("failed to flush file: {}", e))
+        })?;
+
+        file.sync_all().map_err(|e| {
+            LockboxError::SecureDeletionFailed(format!("failed to sync file: {}", e))
+        })?;
+    }
+
+    drop(file);
+    fs::remove_file(path)
+        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to delete file: {}", e)))?;
+
+    Ok(())
+}
+
 /// Encrypts a single file
 ///
 /// - Reads the source file
 /// - Encrypts it with the provided password
 /// - Writes to `<stem>.lb` (original extension is encrypted inside)
-/// - Preserves the original file
-pub fn encrypt_file(source_path: &Path, password: &[u8], force: bool) -> Result<PathBuf> {
-    // Verify source exists
-    if !source_path.exists() {
-        return Err(LockboxError::FileNotFound(
-            source_path.display().to_string(),
-        ));
-    }
-
+/// - If `shred` is true, securely deletes the original file after encryption
+/// - Otherwise preserves the original file
+pub fn encrypt_file(
+    source_path: &Path,
+    password: &[u8],
+    force: bool,
+    shred: bool,
+) -> Result<PathBuf> {
     // Get the original filename (just the filename, not the full path)
     // This includes the extension and will be stored encrypted
     let original_filename = source_path
@@ -87,14 +134,25 @@ pub fn encrypt_file(source_path: &Path, password: &[u8], force: bool) -> Result<
     // Check if we should overwrite
     check_overwrite(&output_path, force)?;
 
-    // Read source file
-    let plaintext = fs::read(source_path)?;
+    // Read source file (handles NotFound without a separate exists() check)
+    let plaintext = fs::read(source_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            LockboxError::FileNotFound(source_path.display().to_string())
+        } else {
+            LockboxError::IoError(e)
+        }
+    })?;
 
     // Encrypt
     let encrypted = create_encrypted_file(password, original_filename, &plaintext)?;
 
     // Write encrypted file
     fs::write(&output_path, encrypted)?;
+
+    // Securely delete the original file if requested
+    if shred {
+        secure_delete(source_path)?;
+    }
 
     Ok(output_path)
 }
@@ -110,13 +168,6 @@ pub fn decrypt_file_to_path(
     output_dir: Option<&Path>,
     force: bool,
 ) -> Result<PathBuf> {
-    // Verify source exists
-    if !source_path.exists() {
-        return Err(LockboxError::FileNotFound(
-            source_path.display().to_string(),
-        ));
-    }
-
     // Verify it has .lb extension
     let extension = source_path
         .extension()
@@ -127,8 +178,14 @@ pub fn decrypt_file_to_path(
         return Err(LockboxError::InvalidExtension);
     }
 
-    // Read encrypted file
-    let encrypted_data = fs::read(source_path)?;
+    // Read encrypted file (handles NotFound without a separate exists() check)
+    let encrypted_data = fs::read(source_path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            LockboxError::FileNotFound(source_path.display().to_string())
+        } else {
+            LockboxError::IoError(e)
+        }
+    })?;
 
     // Decrypt
     let (original_filename, plaintext) = decrypt_file(password, &encrypted_data)?;
@@ -170,6 +227,77 @@ pub fn decrypt_file_to_path(
     Ok(output_path)
 }
 
+/// Recursively collects all files in a directory (not directories themselves)
+pub fn collect_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Err(LockboxError::NotADirectory(dir.display().to_string()));
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current_dir) = stack.pop() {
+        let entries = fs::read_dir(&current_dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            // Follow symlinks by using path.is_dir() / path.is_file()
+            // which resolve symlinks automatically
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+/// Encrypts all files in a directory recursively, preserving structure.
+/// The .lb files are created alongside the originals.
+pub fn encrypt_directory(
+    dir: &Path,
+    password: &[u8],
+    force: bool,
+    shred: bool,
+) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, LockboxError>)>> {
+    let files = collect_files_recursive(dir)?;
+    let mut results = Vec::new();
+    for file in files {
+        let result = encrypt_file(&file, password, force, shred);
+        results.push((file, result));
+    }
+    Ok(results)
+}
+
+/// Decrypts all .lb files in a directory recursively.
+/// Output preserves directory structure relative to the source dir.
+pub fn decrypt_directory(
+    dir: &Path,
+    password: &[u8],
+    output_dir: Option<&Path>,
+    force: bool,
+) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, LockboxError>)>> {
+    let files = collect_files_recursive(dir)?;
+    let mut results = Vec::new();
+    for file in files {
+        // Only process .lb files
+        if file.extension().and_then(|e| e.to_str()) != Some(LOCKBOX_EXTENSION) {
+            continue;
+        }
+        // Calculate relative path from source dir to preserve structure
+        let relative = file.strip_prefix(dir).unwrap_or(&file);
+        let target_dir = match output_dir {
+            Some(base) => base.join(relative.parent().unwrap_or(Path::new(""))),
+            None => file.parent().unwrap_or(Path::new("")).to_path_buf(),
+        };
+        let result = decrypt_file_to_path(&file, password, Some(&target_dir), force);
+        results.push((file, result));
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +317,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "secret.txt", b"my secret data");
 
-        let result = encrypt_file(&source, b"password", true).unwrap();
+        let result = encrypt_file(&source, b"password", true, false).unwrap();
 
         assert_eq!(result, temp_dir.path().join("secret.lb"));
         assert!(result.exists());
@@ -201,7 +329,7 @@ mod tests {
         let content = b"original content";
         let source = create_temp_file(&temp_dir, "file.txt", content);
 
-        encrypt_file(&source, b"password", true).unwrap();
+        encrypt_file(&source, b"password", true, false).unwrap();
 
         // Original file should still exist with same content
         assert!(source.exists());
@@ -210,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_file_nonexistent_fails() {
-        let result = encrypt_file(Path::new("/nonexistent/file.txt"), b"password", true);
+        let result = encrypt_file(Path::new("/nonexistent/file.txt"), b"password", true, false);
         assert!(matches!(result, Err(LockboxError::FileNotFound(_))));
     }
 
@@ -220,17 +348,17 @@ mod tests {
 
         // Test .pdf
         let pdf = create_temp_file(&temp_dir, "doc.pdf", b"pdf content");
-        let result = encrypt_file(&pdf, b"pass", true).unwrap();
+        let result = encrypt_file(&pdf, b"pass", true, false).unwrap();
         assert_eq!(result.file_name().unwrap(), "doc.lb");
 
         // Test .tar.gz (only last extension is removed)
         let targz = create_temp_file(&temp_dir, "archive.tar.gz", b"archive");
-        let result = encrypt_file(&targz, b"pass", true).unwrap();
+        let result = encrypt_file(&targz, b"pass", true, false).unwrap();
         assert_eq!(result.file_name().unwrap(), "archive.tar.lb");
 
         // Test no extension
         let noext = create_temp_file(&temp_dir, "noextension", b"data");
-        let result = encrypt_file(&noext, b"pass", true).unwrap();
+        let result = encrypt_file(&noext, b"pass", true, false).unwrap();
         assert_eq!(result.file_name().unwrap(), "noextension.lb");
     }
 
@@ -239,7 +367,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "test.txt", b"test data");
 
-        let encrypted_path = encrypt_file(&source, b"password", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"password", true, false).unwrap();
         let encrypted_data = fs::read(&encrypted_path).unwrap();
 
         // Should start with magic bytes
@@ -255,7 +383,7 @@ mod tests {
         let source = subdir.join("file.txt");
         fs::write(&source, b"data").unwrap();
 
-        let result = encrypt_file(&source, b"pass", true).unwrap();
+        let result = encrypt_file(&source, b"pass", true, false).unwrap();
         assert_eq!(result, subdir.join("file.lb"));
     }
 
@@ -268,7 +396,7 @@ mod tests {
         let source = create_temp_file(&temp_dir, "original.txt", original_content);
 
         // Encrypt
-        let encrypted_path = encrypt_file(&source, b"mypassword", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"mypassword", true, false).unwrap();
 
         // Decrypt to different directory
         let output_dir = temp_dir.path().join("output");
@@ -301,7 +429,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "secret.txt", b"data");
 
-        let encrypted_path = encrypt_file(&source, b"correct_password", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"correct_password", true, false).unwrap();
         let result = decrypt_file_to_path(&encrypted_path, b"wrong_password", None, true);
 
         assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
@@ -311,7 +439,7 @@ mod tests {
     fn test_decrypt_file_creates_output_directory() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "file.txt", b"data");
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
 
         let nested_output = temp_dir.path().join("a").join("b").join("c");
         assert!(!nested_output.exists());
@@ -325,7 +453,7 @@ mod tests {
     fn test_decrypt_file_to_current_directory() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "myfile.txt", b"content");
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
 
         // Change to temp directory for this test
         let original_dir = std::env::current_dir().unwrap();
@@ -344,7 +472,7 @@ mod tests {
     fn test_decrypt_corrupted_file_fails() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "file.txt", b"data");
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
 
         // Corrupt the encrypted file
         let mut encrypted_data = fs::read(&encrypted_path).unwrap();
@@ -391,7 +519,7 @@ mod tests {
 
         for (name, content) in &files {
             let source = create_temp_file(&temp_dir, name, content);
-            let encrypted = encrypt_file(&source, password, true).unwrap();
+            let encrypted = encrypt_file(&source, password, true, false).unwrap();
 
             let output_dir = temp_dir.path().join("decrypted");
             let decrypted =
@@ -408,7 +536,7 @@ mod tests {
         let large_content = vec![0xABu8; 5 * 1024 * 1024]; // 5 MB
         let source = create_temp_file(&temp_dir, "large.bin", &large_content);
 
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         let output_dir = temp_dir.path().join("out");
         let decrypted_path =
             decrypt_file_to_path(&encrypted_path, b"pass", Some(&output_dir), true).unwrap();
@@ -421,7 +549,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "empty.txt", b"");
 
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         let output_dir = temp_dir.path().join("out");
         let decrypted_path =
             decrypt_file_to_path(&encrypted_path, b"pass", Some(&output_dir), true).unwrap();
@@ -434,7 +562,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "file with spaces (1).txt", b"content");
 
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         let output_dir = temp_dir.path().join("out");
         let decrypted_path =
             decrypt_file_to_path(&encrypted_path, b"pass", Some(&output_dir), true).unwrap();
@@ -456,7 +584,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link_path).unwrap();
 
         // Encrypting the symlink should encrypt the target's content
-        let encrypted_path = encrypt_file(&link_path, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&link_path, b"pass", true, false).unwrap();
         assert!(encrypted_path.exists());
 
         // Decrypt and verify we got the target's content
@@ -481,7 +609,7 @@ mod tests {
 
         // Dangling symlink — the target doesn't exist
         // fs::read will fail with an IO error
-        let result = encrypt_file(&link_path, b"pass", true);
+        let result = encrypt_file(&link_path, b"pass", true, false);
         assert!(result.is_err(), "Encrypting a dangling symlink should fail");
     }
 
@@ -494,7 +622,7 @@ mod tests {
         fs::create_dir(&dir_path).unwrap();
 
         // Attempting to encrypt a directory should fail (fs::read on a dir fails)
-        let result = encrypt_file(&dir_path, b"pass", true);
+        let result = encrypt_file(&dir_path, b"pass", true, false);
         assert!(result.is_err(), "Encrypting a directory should fail");
     }
 
@@ -521,7 +649,7 @@ mod tests {
         // Remove read permission
         fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = encrypt_file(&source, b"pass", true);
+        let result = encrypt_file(&source, b"pass", true, false);
 
         // Restore permissions so temp_dir cleanup works
         fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
@@ -547,7 +675,7 @@ mod tests {
         // Make directory read-only (can't create new files)
         fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-        let result = encrypt_file(&source, b"pass", true);
+        let result = encrypt_file(&source, b"pass", true, false);
 
         // Restore permissions for cleanup
         fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755)).unwrap();
@@ -565,7 +693,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "file.txt", b"data");
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
 
         // Create a read-only output directory
         let output_dir = temp_dir.path().join("readonly_out");
@@ -592,11 +720,11 @@ mod tests {
         let source = create_temp_file(&temp_dir, "secret.txt", original_content);
 
         // First encryption: secret.txt -> secret.lb
-        let first_encrypted = encrypt_file(&source, b"pass1", true).unwrap();
+        let first_encrypted = encrypt_file(&source, b"pass1", true, false).unwrap();
         assert_eq!(first_encrypted.file_name().unwrap(), "secret.lb");
 
         // Second encryption: secret.lb -> secret.lb (overwrites with force)
-        let second_encrypted = encrypt_file(&first_encrypted, b"pass2", true).unwrap();
+        let second_encrypted = encrypt_file(&first_encrypted, b"pass2", true, false).unwrap();
         assert_eq!(second_encrypted.file_name().unwrap(), "secret.lb");
 
         // Decrypt outer layer
@@ -622,14 +750,14 @@ mod tests {
         let source = create_temp_file(&temp_dir, "file.txt", b"content v1");
 
         // Create initial .lb file
-        let encrypted_path = encrypt_file(&source, b"pass1", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass1", true, false).unwrap();
         let first_size = fs::metadata(&encrypted_path).unwrap().len();
 
         // Overwrite the source with different content
         fs::write(&source, b"content v2 which is longer").unwrap();
 
         // Encrypt again with force — should overwrite the .lb file
-        let encrypted_path2 = encrypt_file(&source, b"pass2", true).unwrap();
+        let encrypted_path2 = encrypt_file(&source, b"pass2", true, false).unwrap();
         let second_size = fs::metadata(&encrypted_path2).unwrap().len();
 
         assert_eq!(encrypted_path, encrypted_path2);
@@ -698,7 +826,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, ".hidden", b"hidden file content");
 
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         // .hidden has no extension, stem is ".hidden"
         assert_eq!(encrypted_path.file_name().unwrap(), ".hidden.lb");
 
@@ -717,7 +845,7 @@ mod tests {
 
         // Encrypting a .lb file should produce "test.lb" as output (same name!)
         // With force=true it should overwrite
-        let encrypted_path = encrypt_file(&source, b"pass", true).unwrap();
+        let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         assert_eq!(encrypted_path.file_name().unwrap(), "test.lb");
     }
 
@@ -754,7 +882,7 @@ mod tests {
             let source = create_temp_file(&temp_dir, "readonly.txt", b"read only data");
             fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
 
-            let result = encrypt_file(&source, b"pass", true);
+            let result = encrypt_file(&source, b"pass", true, false);
 
             // Restore for cleanup
             fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
@@ -765,5 +893,232 @@ mod tests {
                 decrypt_file_to_path(&result.unwrap(), b"pass", Some(&output_dir), true).unwrap();
             assert_eq!(fs::read(&decrypted).unwrap(), b"read only data");
         }
+    }
+
+    // ==================== Secure Delete Tests ====================
+
+    #[test]
+    fn test_secure_delete_removes_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_temp_file(&temp_dir, "to_delete.txt", b"sensitive data");
+
+        assert!(path.exists());
+        secure_delete(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_encrypt_with_shred_deletes_original() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = b"secret content to shred";
+        let source = create_temp_file(&temp_dir, "shred_me.txt", content);
+
+        let encrypted_path = encrypt_file(&source, b"password", true, true).unwrap();
+
+        // Original should be gone
+        assert!(!source.exists());
+        // Encrypted file should exist
+        assert!(encrypted_path.exists());
+
+        // Verify we can still decrypt to get the original content
+        let output_dir = temp_dir.path().join("out");
+        let decrypted =
+            decrypt_file_to_path(&encrypted_path, b"password", Some(&output_dir), true).unwrap();
+        assert_eq!(fs::read(&decrypted).unwrap(), content);
+    }
+
+    #[test]
+    fn test_encrypt_without_shred_preserves_original() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = b"keep this file";
+        let source = create_temp_file(&temp_dir, "keep_me.txt", content);
+
+        let encrypted_path = encrypt_file(&source, b"password", true, false).unwrap();
+
+        // Original should still exist
+        assert!(source.exists());
+        assert_eq!(fs::read(&source).unwrap(), content);
+        // Encrypted file should also exist
+        assert!(encrypted_path.exists());
+    }
+
+    // ==================== Directory Recursion Tests ====================
+
+    fn create_nested_dir_structure(base: &Path) {
+        // base/
+        //   file1.txt
+        //   sub1/
+        //     file2.txt
+        //     sub2/
+        //       file3.txt
+        fs::create_dir_all(base.join("sub1").join("sub2")).unwrap();
+        fs::write(base.join("file1.txt"), b"content1").unwrap();
+        fs::write(base.join("sub1").join("file2.txt"), b"content2").unwrap();
+        fs::write(
+            base.join("sub1").join("sub2").join("file3.txt"),
+            b"content3",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_collect_files_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("root");
+        create_nested_dir_structure(&base);
+
+        let files = collect_files_recursive(&base).unwrap();
+
+        assert_eq!(files.len(), 3);
+        // Files are sorted, so order is deterministic
+        assert!(files.contains(&base.join("file1.txt")));
+        assert!(files.contains(&base.join("sub1").join("file2.txt")));
+        assert!(files.contains(&base.join("sub1").join("sub2").join("file3.txt")));
+    }
+
+    #[test]
+    fn test_collect_files_recursive_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let empty = temp_dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+
+        let files = collect_files_recursive(&empty).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_collect_files_recursive_not_a_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = create_temp_file(&temp_dir, "not_a_dir.txt", b"data");
+
+        let result = collect_files_recursive(&file);
+        assert!(matches!(result, Err(LockboxError::NotADirectory(_))));
+    }
+
+    #[test]
+    fn test_encrypt_directory_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("source");
+        create_nested_dir_structure(&base);
+
+        let password = b"dir_password";
+
+        // Encrypt all files in the directory
+        let enc_results = encrypt_directory(&base, password, true, false).unwrap();
+        assert_eq!(enc_results.len(), 3);
+        for (_, result) in &enc_results {
+            assert!(result.is_ok());
+        }
+
+        // Decrypt all .lb files in the directory to an output dir
+        let output = temp_dir.path().join("output");
+        let dec_results = decrypt_directory(&base, password, Some(&output), true).unwrap();
+        assert_eq!(dec_results.len(), 3);
+        for (_, result) in &dec_results {
+            assert!(result.is_ok());
+        }
+
+        // Verify contents match originals
+        assert_eq!(fs::read(output.join("file1.txt")).unwrap(), b"content1");
+        assert_eq!(
+            fs::read(output.join("sub1").join("file2.txt")).unwrap(),
+            b"content2"
+        );
+        assert_eq!(
+            fs::read(output.join("sub1").join("sub2").join("file3.txt")).unwrap(),
+            b"content3"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_directory_preserves_structure() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("source");
+        create_nested_dir_structure(&base);
+
+        let password = b"structure_password";
+
+        let results = encrypt_directory(&base, password, true, false).unwrap();
+
+        // Verify .lb files are created alongside originals in the same directories
+        for (source, result) in &results {
+            let encrypted_path = result.as_ref().unwrap();
+            assert_eq!(
+                encrypted_path.parent().unwrap(),
+                source.parent().unwrap(),
+                "Encrypted file should be in the same directory as the original"
+            );
+            assert_eq!(encrypted_path.extension().unwrap(), LOCKBOX_EXTENSION);
+            assert!(encrypted_path.exists());
+        }
+
+        // Check specific paths
+        assert!(base.join("file1.lb").exists());
+        assert!(base.join("sub1").join("file2.lb").exists());
+        assert!(base.join("sub1").join("sub2").join("file3.lb").exists());
+    }
+
+    #[test]
+    fn test_decrypt_directory_with_output_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("source");
+        create_nested_dir_structure(&base);
+
+        let password = b"output_dir_test";
+
+        // Encrypt
+        encrypt_directory(&base, password, true, false).unwrap();
+
+        // Decrypt to a separate output directory
+        let output = temp_dir.path().join("decrypted_output");
+        let results = decrypt_directory(&base, password, Some(&output), true).unwrap();
+
+        // All should succeed
+        for (_, result) in &results {
+            assert!(result.is_ok());
+        }
+
+        // Verify structure is preserved in the output directory
+        assert!(output.join("file1.txt").exists());
+        assert!(output.join("sub1").join("file2.txt").exists());
+        assert!(output.join("sub1").join("sub2").join("file3.txt").exists());
+
+        // Verify content
+        assert_eq!(fs::read(output.join("file1.txt")).unwrap(), b"content1");
+        assert_eq!(
+            fs::read(output.join("sub1").join("file2.txt")).unwrap(),
+            b"content2"
+        );
+        assert_eq!(
+            fs::read(output.join("sub1").join("sub2").join("file3.txt")).unwrap(),
+            b"content3"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_directory_with_shred() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("source");
+        create_nested_dir_structure(&base);
+
+        let password = b"shred_dir_test";
+
+        // Encrypt with shred=true
+        let results = encrypt_directory(&base, password, true, true).unwrap();
+
+        // All encryptions should succeed
+        for (_, result) in &results {
+            assert!(result.is_ok());
+        }
+
+        // Original files should be deleted
+        assert!(!base.join("file1.txt").exists());
+        assert!(!base.join("sub1").join("file2.txt").exists());
+        assert!(!base.join("sub1").join("sub2").join("file3.txt").exists());
+
+        // Encrypted files should exist
+        assert!(base.join("file1.lb").exists());
+        assert!(base.join("sub1").join("file2.lb").exists());
+        assert!(base.join("sub1").join("sub2").join("file3.lb").exists());
     }
 }

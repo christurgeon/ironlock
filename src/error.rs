@@ -26,6 +26,12 @@ pub enum LockboxError {
     #[error("Password cannot be empty")]
     EmptyPassword,
 
+    #[error("Secure deletion failed: {0}")]
+    SecureDeletionFailed(String),
+
+    #[error("Not a directory: {0}")]
+    NotADirectory(String),
+
     #[error("Operation cancelled by user")]
     Cancelled,
 }
