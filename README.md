@@ -1,11 +1,19 @@
 # Lockbox 🔐
 
+[![Crates.io](https://img.shields.io/crates/v/lockbox-cli.svg)](https://crates.io/crates/lockbox-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
+[![CI](https://github.com/christurgeon/lockbox/actions/workflows/ci.yaml/badge.svg)](https://github.com/christurgeon/lockbox/actions/workflows/ci.yaml)
 
 A secure file encryption CLI tool built in Rust. Lockbox uses industry-standard cryptographic primitives to protect your files with a password.
 
 ## Installation
+
+### From crates.io (recommended)
+
+```bash
+cargo install lockbox-cli
+```
 
 ### From Source
 
@@ -168,9 +176,19 @@ cargo fmt
 cargo build --release
 ```
 
+## Uninstalling
+
+```bash
+cargo uninstall lockbox-cli
+```
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

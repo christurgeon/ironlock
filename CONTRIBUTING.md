@@ -5,13 +5,15 @@ Thank you for your interest in contributing to Lockbox! This document provides g
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/christurgeon/lockbox.git`
+2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/lockbox.git`
 3. Create a branch: `git checkout -b my-feature`
 4. Make your changes
 5. Run tests: `cargo test`
 6. Run lints: `cargo clippy && cargo fmt --check`
 7. Commit your changes
 8. Push and create a Pull Request
+
+> **Note:** The crate is published to crates.io as [`lockbox-cli`](https://crates.io/crates/lockbox-cli). The binary is named `lockbox`.
 
 ## Development Setup
 

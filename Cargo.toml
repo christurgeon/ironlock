@@ -12,7 +12,7 @@ repository = "https://github.com/christurgeon/lockbox"
 homepage = "https://github.com/christurgeon/lockbox"
 documentation = "https://github.com/christurgeon/lockbox#readme"
 authors = ["Chris Turgeon <turgeonchris3@outlook.com>"]
-exclude = [".github/", "tests/", "*.lb"]
+exclude = [".github/", "tests/", "*.lb", "CLAUDE.md"]
 
 [[bin]]
 name = "lockbox"
