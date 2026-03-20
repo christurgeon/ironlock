@@ -6,10 +6,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use crate::crypto::{create_encrypted_file, decrypt_file};
-use crate::error::{LockboxError, Result};
+use crate::error::{IronlockError, Result};
 
-/// The extension for encrypted lockbox files
-pub const LOCKBOX_EXTENSION: &str = "lb";
+/// The extension for encrypted ironlock files
+pub const IRONLOCK_EXTENSION: &str = "il";
 
 /// Threshold (in bytes) above which we warn about in-memory file loading.
 /// Currently 1 GiB.
@@ -39,7 +39,7 @@ pub fn check_overwrite(path: &Path, force: bool) -> Result<()> {
         if prompt_confirmation(&prompt)? {
             Ok(())
         } else {
-            Err(LockboxError::Cancelled)
+            Err(IronlockError::Cancelled)
         }
     } else {
         Ok(())
@@ -54,13 +54,15 @@ pub fn secure_delete(path: &Path) -> Result<()> {
     use std::io::Seek;
 
     let file_size = fs::metadata(path)
-        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to read metadata: {}", e)))?
+        .map_err(|e| {
+            IronlockError::SecureDeletionFailed(format!("failed to read metadata: {}", e))
+        })?
         .len() as usize;
 
     let mut file = OpenOptions::new()
         .write(true)
         .open(path)
-        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to open file: {}", e)))?;
+        .map_err(|e| IronlockError::SecureDeletionFailed(format!("failed to open file: {}", e)))?;
 
     let mut random_data = vec![0u8; file_size];
 
@@ -68,25 +70,26 @@ pub fn secure_delete(path: &Path) -> Result<()> {
         OsRng.fill_bytes(&mut random_data);
 
         file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
-            LockboxError::SecureDeletionFailed(format!("failed to seek file: {}", e))
+            IronlockError::SecureDeletionFailed(format!("failed to seek file: {}", e))
         })?;
 
         file.write_all(&random_data).map_err(|e| {
-            LockboxError::SecureDeletionFailed(format!("failed to overwrite file: {}", e))
+            IronlockError::SecureDeletionFailed(format!("failed to overwrite file: {}", e))
         })?;
 
         file.flush().map_err(|e| {
-            LockboxError::SecureDeletionFailed(format!("failed to flush file: {}", e))
+            IronlockError::SecureDeletionFailed(format!("failed to flush file: {}", e))
         })?;
 
         file.sync_all().map_err(|e| {
-            LockboxError::SecureDeletionFailed(format!("failed to sync file: {}", e))
+            IronlockError::SecureDeletionFailed(format!("failed to sync file: {}", e))
         })?;
     }
 
     drop(file);
-    fs::remove_file(path)
-        .map_err(|e| LockboxError::SecureDeletionFailed(format!("failed to delete file: {}", e)))?;
+    fs::remove_file(path).map_err(|e| {
+        IronlockError::SecureDeletionFailed(format!("failed to delete file: {}", e))
+    })?;
 
     Ok(())
 }
@@ -95,7 +98,7 @@ pub fn secure_delete(path: &Path) -> Result<()> {
 ///
 /// - Reads the source file
 /// - Encrypts it with the provided password
-/// - Writes to `<stem>.lb` (original extension is encrypted inside)
+/// - Writes to `<stem>.il` (original extension is encrypted inside)
 /// - If `shred` is true, securely deletes the original file after encryption
 /// - Otherwise preserves the original file
 pub fn encrypt_file(
@@ -110,7 +113,7 @@ pub fn encrypt_file(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
-            LockboxError::IoError(io::Error::new(
+            IronlockError::IoError(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid filename",
             ))
@@ -121,19 +124,19 @@ pub fn encrypt_file(
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| {
-            LockboxError::IoError(io::Error::new(
+            IronlockError::IoError(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid filename",
             ))
         })?
         .to_string();
 
-    // Create the output path: same directory, stem + lb
-    // e.g., "secret.txt" -> "secret.lb", "document.pdf" -> "document.lb"
+    // Create the output path: same directory, stem + il
+    // e.g., "secret.txt" -> "secret.il", "document.pdf" -> "document.il"
     let output_path = source_path
         .parent()
-        .map(|p| p.join(format!("{}.{}", file_stem, LOCKBOX_EXTENSION)))
-        .unwrap_or_else(|| PathBuf::from(format!("{}.{}", file_stem, LOCKBOX_EXTENSION)));
+        .map(|p| p.join(format!("{}.{}", file_stem, IRONLOCK_EXTENSION)))
+        .unwrap_or_else(|| PathBuf::from(format!("{}.{}", file_stem, IRONLOCK_EXTENSION)));
 
     // Check if we should overwrite
     check_overwrite(&output_path, force)?;
@@ -143,7 +146,7 @@ pub fn encrypt_file(
         let size = metadata.len();
         if size > LARGE_FILE_THRESHOLD {
             eprintln!(
-                "Warning: '{}' is {:.1} GiB — Lockbox loads the entire file into memory. \
+                "Warning: '{}' is {:.1} GiB — Ironlock loads the entire file into memory. \
                  Ensure you have enough RAM or use stdin piping for very large files.",
                 source_path.display(),
                 size as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -154,9 +157,9 @@ pub fn encrypt_file(
     // Read source file (handles NotFound without a separate exists() check)
     let plaintext = fs::read(source_path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            LockboxError::FileNotFound(source_path.display().to_string())
+            IronlockError::FileNotFound(source_path.display().to_string())
         } else {
-            LockboxError::IoError(e)
+            IronlockError::IoError(e)
         }
     })?;
 
@@ -174,7 +177,7 @@ pub fn encrypt_file(
     Ok(output_path)
 }
 
-/// Decrypts a single .lb file
+/// Decrypts a single .il file
 ///
 /// - Reads the encrypted file
 /// - Decrypts it with the provided password
@@ -185,14 +188,14 @@ pub fn decrypt_file_to_path(
     output_dir: Option<&Path>,
     force: bool,
 ) -> Result<PathBuf> {
-    // Verify it has .lb extension
+    // Verify it has .il extension
     let extension = source_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
-    if extension != LOCKBOX_EXTENSION {
-        return Err(LockboxError::InvalidExtension);
+    if extension != IRONLOCK_EXTENSION {
+        return Err(IronlockError::InvalidExtension);
     }
 
     // Warn if the file is very large (everything is loaded into memory)
@@ -200,7 +203,7 @@ pub fn decrypt_file_to_path(
         let size = metadata.len();
         if size > LARGE_FILE_THRESHOLD {
             eprintln!(
-                "Warning: '{}' is {:.1} GiB — Lockbox loads the entire file into memory. \
+                "Warning: '{}' is {:.1} GiB — Ironlock loads the entire file into memory. \
                  Ensure you have enough RAM or use stdin piping for very large files.",
                 source_path.display(),
                 size as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -211,9 +214,9 @@ pub fn decrypt_file_to_path(
     // Read encrypted file (handles NotFound without a separate exists() check)
     let encrypted_data = fs::read(source_path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            LockboxError::FileNotFound(source_path.display().to_string())
+            IronlockError::FileNotFound(source_path.display().to_string())
         } else {
-            LockboxError::IoError(e)
+            IronlockError::IoError(e)
         }
     })?;
 
@@ -226,7 +229,7 @@ pub fn decrypt_file_to_path(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
-            LockboxError::IoError(io::Error::new(
+            IronlockError::IoError(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid or empty filename in encrypted file",
             ))
@@ -260,7 +263,7 @@ pub fn decrypt_file_to_path(
 /// Recursively collects all files in a directory (not directories themselves)
 pub fn collect_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
-        return Err(LockboxError::NotADirectory(dir.display().to_string()));
+        return Err(IronlockError::NotADirectory(dir.display().to_string()));
     }
 
     let mut files = Vec::new();
@@ -285,14 +288,14 @@ pub fn collect_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Encrypts all files in a directory recursively, preserving structure.
-/// The .lb files are created alongside the originals.
+/// The .il files are created alongside the originals.
 #[cfg(test)]
 pub fn encrypt_directory(
     dir: &Path,
     password: &[u8],
     force: bool,
     shred: bool,
-) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, LockboxError>)>> {
+) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, IronlockError>)>> {
     let files = collect_files_recursive(dir)?;
     let mut results = Vec::new();
     for file in files {
@@ -302,7 +305,7 @@ pub fn encrypt_directory(
     Ok(results)
 }
 
-/// Decrypts all .lb files in a directory recursively.
+/// Decrypts all .il files in a directory recursively.
 /// Output preserves directory structure relative to the source dir.
 #[cfg(test)]
 pub fn decrypt_directory(
@@ -310,12 +313,12 @@ pub fn decrypt_directory(
     password: &[u8],
     output_dir: Option<&Path>,
     force: bool,
-) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, LockboxError>)>> {
+) -> Result<Vec<(PathBuf, std::result::Result<PathBuf, IronlockError>)>> {
     let files = collect_files_recursive(dir)?;
     let mut results = Vec::new();
     for file in files {
-        // Only process .lb files
-        if file.extension().and_then(|e| e.to_str()) != Some(LOCKBOX_EXTENSION) {
+        // Only process .il files
+        if file.extension().and_then(|e| e.to_str()) != Some(IRONLOCK_EXTENSION) {
             continue;
         }
         // Calculate relative path from source dir to preserve structure
@@ -345,13 +348,13 @@ mod tests {
     // ==================== encrypt_file Tests ====================
 
     #[test]
-    fn test_encrypt_file_creates_lb_file() {
+    fn test_encrypt_file_creates_il_file() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "secret.txt", b"my secret data");
 
         let result = encrypt_file(&source, b"password", true, false).unwrap();
 
-        assert_eq!(result, temp_dir.path().join("secret.lb"));
+        assert_eq!(result, temp_dir.path().join("secret.il"));
         assert!(result.exists());
     }
 
@@ -371,7 +374,7 @@ mod tests {
     #[test]
     fn test_encrypt_file_nonexistent_fails() {
         let result = encrypt_file(Path::new("/nonexistent/file.txt"), b"password", true, false);
-        assert!(matches!(result, Err(LockboxError::FileNotFound(_))));
+        assert!(matches!(result, Err(IronlockError::FileNotFound(_))));
     }
 
     #[test]
@@ -381,21 +384,21 @@ mod tests {
         // Test .pdf
         let pdf = create_temp_file(&temp_dir, "doc.pdf", b"pdf content");
         let result = encrypt_file(&pdf, b"pass", true, false).unwrap();
-        assert_eq!(result.file_name().unwrap(), "doc.lb");
+        assert_eq!(result.file_name().unwrap(), "doc.il");
 
         // Test .tar.gz (only last extension is removed)
         let targz = create_temp_file(&temp_dir, "archive.tar.gz", b"archive");
         let result = encrypt_file(&targz, b"pass", true, false).unwrap();
-        assert_eq!(result.file_name().unwrap(), "archive.tar.lb");
+        assert_eq!(result.file_name().unwrap(), "archive.tar.il");
 
         // Test no extension
         let noext = create_temp_file(&temp_dir, "noextension", b"data");
         let result = encrypt_file(&noext, b"pass", true, false).unwrap();
-        assert_eq!(result.file_name().unwrap(), "noextension.lb");
+        assert_eq!(result.file_name().unwrap(), "noextension.il");
     }
 
     #[test]
-    fn test_encrypt_file_output_is_valid_lockbox_format() {
+    fn test_encrypt_file_output_is_valid_ironlock_format() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "test.txt", b"test data");
 
@@ -403,7 +406,7 @@ mod tests {
         let encrypted_data = fs::read(&encrypted_path).unwrap();
 
         // Should start with magic bytes
-        assert_eq!(&encrypted_data[0..8], b"LOCKBOX\x01");
+        assert_eq!(&encrypted_data[0..8], b"IRONLOCK");
     }
 
     #[test]
@@ -416,7 +419,7 @@ mod tests {
         fs::write(&source, b"data").unwrap();
 
         let result = encrypt_file(&source, b"pass", true, false).unwrap();
-        assert_eq!(result, subdir.join("file.lb"));
+        assert_eq!(result, subdir.join("file.il"));
     }
 
     // ==================== decrypt_file_to_path Tests ====================
@@ -446,14 +449,14 @@ mod tests {
         let source = create_temp_file(&temp_dir, "file.txt", b"not encrypted");
 
         let result = decrypt_file_to_path(&source, b"password", None, true);
-        assert!(matches!(result, Err(LockboxError::InvalidExtension)));
+        assert!(matches!(result, Err(IronlockError::InvalidExtension)));
     }
 
     #[test]
     fn test_decrypt_file_nonexistent_fails() {
         let result =
-            decrypt_file_to_path(Path::new("/nonexistent/file.lb"), b"password", None, true);
-        assert!(matches!(result, Err(LockboxError::FileNotFound(_))));
+            decrypt_file_to_path(Path::new("/nonexistent/file.il"), b"password", None, true);
+        assert!(matches!(result, Err(IronlockError::FileNotFound(_))));
     }
 
     #[test]
@@ -464,7 +467,7 @@ mod tests {
         let encrypted_path = encrypt_file(&source, b"correct_password", true, false).unwrap();
         let result = decrypt_file_to_path(&encrypted_path, b"wrong_password", None, true);
 
-        assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
+        assert!(matches!(result, Err(IronlockError::DecryptionFailed)));
     }
 
     #[test]
@@ -661,7 +664,7 @@ mod tests {
     #[test]
     fn test_decrypt_directory_as_source_fails() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path().join("fake.lb");
+        let dir_path = temp_dir.path().join("fake.il");
         fs::create_dir(&dir_path).unwrap();
 
         let result = decrypt_file_to_path(&dir_path, b"pass", None, true);
@@ -687,7 +690,7 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(
-            matches!(result, Err(LockboxError::IoError(_))),
+            matches!(result, Err(IronlockError::IoError(_))),
             "Encrypting an unreadable file should return IoError"
         );
     }
@@ -713,7 +716,7 @@ mod tests {
         fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            matches!(result, Err(LockboxError::IoError(_))),
+            matches!(result, Err(IronlockError::IoError(_))),
             "Writing to a read-only directory should return IoError"
         );
     }
@@ -738,7 +741,7 @@ mod tests {
         fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            matches!(result, Err(LockboxError::IoError(_))),
+            matches!(result, Err(IronlockError::IoError(_))),
             "Decrypting to a read-only output directory should return IoError"
         );
     }
@@ -751,20 +754,20 @@ mod tests {
         let original_content = b"double encrypted secret";
         let source = create_temp_file(&temp_dir, "secret.txt", original_content);
 
-        // First encryption: secret.txt -> secret.lb
+        // First encryption: secret.txt -> secret.il
         let first_encrypted = encrypt_file(&source, b"pass1", true, false).unwrap();
-        assert_eq!(first_encrypted.file_name().unwrap(), "secret.lb");
+        assert_eq!(first_encrypted.file_name().unwrap(), "secret.il");
 
-        // Second encryption: secret.lb -> secret.lb (overwrites with force)
+        // Second encryption: secret.il -> secret.il (overwrites with force)
         let second_encrypted = encrypt_file(&first_encrypted, b"pass2", true, false).unwrap();
-        assert_eq!(second_encrypted.file_name().unwrap(), "secret.lb");
+        assert_eq!(second_encrypted.file_name().unwrap(), "secret.il");
 
         // Decrypt outer layer
         let mid_dir = temp_dir.path().join("mid");
         let mid_decrypted =
             decrypt_file_to_path(&second_encrypted, b"pass2", Some(&mid_dir), true).unwrap();
-        // The recovered filename should be "secret.lb" (the name at the time of second encryption)
-        assert_eq!(mid_decrypted.file_name().unwrap(), "secret.lb");
+        // The recovered filename should be "secret.il" (the name at the time of second encryption)
+        assert_eq!(mid_decrypted.file_name().unwrap(), "secret.il");
 
         // Decrypt inner layer
         let final_dir = temp_dir.path().join("final");
@@ -777,18 +780,18 @@ mod tests {
     // ==================== Overwrite Behavior Tests ====================
 
     #[test]
-    fn test_encrypt_with_force_overwrites_existing_lb() {
+    fn test_encrypt_with_force_overwrites_existing_il() {
         let temp_dir = TempDir::new().unwrap();
         let source = create_temp_file(&temp_dir, "file.txt", b"content v1");
 
-        // Create initial .lb file
+        // Create initial .il file
         let encrypted_path = encrypt_file(&source, b"pass1", true, false).unwrap();
         let first_size = fs::metadata(&encrypted_path).unwrap().len();
 
         // Overwrite the source with different content
         fs::write(&source, b"content v2 which is longer").unwrap();
 
-        // Encrypt again with force — should overwrite the .lb file
+        // Encrypt again with force — should overwrite the .il file
         let encrypted_path2 = encrypt_file(&source, b"pass2", true, false).unwrap();
         let second_size = fs::metadata(&encrypted_path2).unwrap().len();
 
@@ -816,7 +819,7 @@ mod tests {
             crate::crypto::create_encrypted_file(password, traversal_filename, content).unwrap();
 
         let temp_dir = TempDir::new().unwrap();
-        let lb_path = temp_dir.path().join("evil.lb");
+        let lb_path = temp_dir.path().join("evil.il");
         fs::write(&lb_path, &encrypted_data).unwrap();
 
         let output_dir = temp_dir.path().join("output");
@@ -839,7 +842,7 @@ mod tests {
             crate::crypto::create_encrypted_file(password, abs_filename, content).unwrap();
 
         let temp_dir = TempDir::new().unwrap();
-        let lb_path = temp_dir.path().join("abs.lb");
+        let lb_path = temp_dir.path().join("abs.il");
         fs::write(&lb_path, &encrypted_data).unwrap();
 
         let output_dir = temp_dir.path().join("output");
@@ -860,7 +863,7 @@ mod tests {
 
         let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
         // .hidden has no extension, stem is ".hidden"
-        assert_eq!(encrypted_path.file_name().unwrap(), ".hidden.lb");
+        assert_eq!(encrypted_path.file_name().unwrap(), ".hidden.il");
 
         let output_dir = temp_dir.path().join("out");
         let decrypted =
@@ -870,26 +873,26 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_file_named_just_dot_lb_extension() {
-        // A file literally named ".lb" — stem is empty-ish
+    fn test_encrypt_file_named_just_dot_il_extension() {
+        // A file literally named ".il" — stem is empty-ish
         let temp_dir = TempDir::new().unwrap();
-        let source = create_temp_file(&temp_dir, "test.lb", b"already has lb ext");
+        let source = create_temp_file(&temp_dir, "test.il", b"already has il ext");
 
-        // Encrypting a .lb file should produce "test.lb" as output (same name!)
+        // Encrypting a .il file should produce "test.il" as output (same name!)
         // With force=true it should overwrite
         let encrypted_path = encrypt_file(&source, b"pass", true, false).unwrap();
-        assert_eq!(encrypted_path.file_name().unwrap(), "test.lb");
+        assert_eq!(encrypted_path.file_name().unwrap(), "test.il");
     }
 
     #[test]
-    fn test_decrypt_file_without_lb_extension_variants() {
+    fn test_decrypt_file_without_il_extension_variants() {
         let temp_dir = TempDir::new().unwrap();
 
         // File with .LB (uppercase) should fail — extension check is case-sensitive
         let upper = create_temp_file(&temp_dir, "file.LB", b"data");
         let result = decrypt_file_to_path(&upper, b"pass", None, true);
         assert!(
-            matches!(result, Err(LockboxError::InvalidExtension)),
+            matches!(result, Err(IronlockError::InvalidExtension)),
             "Uppercase .LB should not be accepted"
         );
 
@@ -897,7 +900,7 @@ mod tests {
         let noext = create_temp_file(&temp_dir, "file", b"data");
         let result = decrypt_file_to_path(&noext, b"pass", None, true);
         assert!(
-            matches!(result, Err(LockboxError::InvalidExtension)),
+            matches!(result, Err(IronlockError::InvalidExtension)),
             "File with no extension should not be accepted for decryption"
         );
     }
@@ -1024,7 +1027,7 @@ mod tests {
         let file = create_temp_file(&temp_dir, "not_a_dir.txt", b"data");
 
         let result = collect_files_recursive(&file);
-        assert!(matches!(result, Err(LockboxError::NotADirectory(_))));
+        assert!(matches!(result, Err(IronlockError::NotADirectory(_))));
     }
 
     #[test]
@@ -1042,7 +1045,7 @@ mod tests {
             assert!(result.is_ok());
         }
 
-        // Decrypt all .lb files in the directory to an output dir
+        // Decrypt all .il files in the directory to an output dir
         let output = temp_dir.path().join("output");
         let dec_results = decrypt_directory(&base, password, Some(&output), true).unwrap();
         assert_eq!(dec_results.len(), 3);
@@ -1072,7 +1075,7 @@ mod tests {
 
         let results = encrypt_directory(&base, password, true, false).unwrap();
 
-        // Verify .lb files are created alongside originals in the same directories
+        // Verify .il files are created alongside originals in the same directories
         for (source, result) in &results {
             let encrypted_path = result.as_ref().unwrap();
             assert_eq!(
@@ -1080,14 +1083,14 @@ mod tests {
                 source.parent().unwrap(),
                 "Encrypted file should be in the same directory as the original"
             );
-            assert_eq!(encrypted_path.extension().unwrap(), LOCKBOX_EXTENSION);
+            assert_eq!(encrypted_path.extension().unwrap(), IRONLOCK_EXTENSION);
             assert!(encrypted_path.exists());
         }
 
         // Check specific paths
-        assert!(base.join("file1.lb").exists());
-        assert!(base.join("sub1").join("file2.lb").exists());
-        assert!(base.join("sub1").join("sub2").join("file3.lb").exists());
+        assert!(base.join("file1.il").exists());
+        assert!(base.join("sub1").join("file2.il").exists());
+        assert!(base.join("sub1").join("sub2").join("file3.il").exists());
     }
 
     #[test]
@@ -1149,8 +1152,8 @@ mod tests {
         assert!(!base.join("sub1").join("sub2").join("file3.txt").exists());
 
         // Encrypted files should exist
-        assert!(base.join("file1.lb").exists());
-        assert!(base.join("sub1").join("file2.lb").exists());
-        assert!(base.join("sub1").join("sub2").join("file3.lb").exists());
+        assert!(base.join("file1.il").exists());
+        assert!(base.join("sub1").join("file2.il").exists());
+        assert!(base.join("sub1").join("sub2").join("file3.il").exists());
     }
 }

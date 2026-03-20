@@ -1,6 +1,6 @@
 [package]
-name = "lockbox-cli"
-version = "0.2.0"
+name = "ironlock"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
 description = "A secure file encryption CLI tool using Argon2id and ChaCha20-Poly1305"
@@ -8,14 +8,14 @@ license = "MIT"
 readme = "README.md"
 keywords = ["encryption", "security", "cli", "cryptography", "file-encryption"]
 categories = ["command-line-utilities", "cryptography"]
-repository = "https://github.com/christurgeon/lockbox"
-homepage = "https://github.com/christurgeon/lockbox"
-documentation = "https://github.com/christurgeon/lockbox#readme"
+repository = "https://github.com/christurgeon/ironlock"
+homepage = "https://github.com/christurgeon/ironlock"
+documentation = "https://github.com/christurgeon/ironlock#readme"
 authors = ["Chris Turgeon <turgeonchris3@outlook.com>"]
-exclude = [".github/", "tests/", "*.lb", "CLAUDE.md"]
+exclude = [".github/", "tests/", "*.il", "CLAUDE.md"]
 
 [[bin]]
-name = "lockbox"
+name = "ironlock"
 path = "src/main.rs"
 
 [dependencies]

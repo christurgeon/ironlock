@@ -1,11 +1,11 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum LockboxError {
+pub enum IronlockError {
     #[error("File not found: {0}")]
     FileNotFound(String),
 
-    #[error("Invalid file extension: expected .lb for decryption")]
+    #[error("Invalid file extension: expected .il for decryption")]
     InvalidExtension,
 
     #[error("Encryption failed: {0}")]
@@ -14,7 +14,7 @@ pub enum LockboxError {
     #[error("Decryption failed: incorrect password or corrupted file")]
     DecryptionFailed,
 
-    #[error("Invalid file format: not a valid Lockbox encrypted file")]
+    #[error("Invalid file format: not a valid Ironlock encrypted file")]
     InvalidFileFormat,
 
     #[error("I/O error: {0}")]
@@ -36,4 +36,4 @@ pub enum LockboxError {
     Cancelled,
 }
 
-pub type Result<T> = std::result::Result<T, LockboxError>;
+pub type Result<T> = std::result::Result<T, IronlockError>;

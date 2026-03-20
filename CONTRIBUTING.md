@@ -1,11 +1,11 @@
-# Contributing to Lockbox
+# Contributing to Ironlock
 
-Thank you for your interest in contributing to Lockbox! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing to Ironlock! This document provides guidelines and information for contributors.
 
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/lockbox.git`
+2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/ironlock.git`
 3. Create a branch: `git checkout -b my-feature`
 4. Make your changes
 5. Run tests: `cargo test`
@@ -13,7 +13,7 @@ Thank you for your interest in contributing to Lockbox! This document provides g
 7. Commit your changes
 8. Push and create a Pull Request
 
-> **Note:** The crate is published to crates.io as [`lockbox-cli`](https://crates.io/crates/lockbox-cli). The binary is named `lockbox`.
+> **Note:** The crate is published to crates.io as [`ironlock`](https://crates.io/crates/ironlock). The binary is also named `ironlock`.
 
 ## Development Setup
 

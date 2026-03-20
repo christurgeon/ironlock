@@ -387,6 +387,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironlock"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "clap",
+ "colored",
+ "indicatif",
+ "libc",
+ "rand",
+ "rpassword",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -431,23 +448,6 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
-name = "lockbox-cli"
-version = "0.2.0"
-dependencies = [
- "argon2",
- "chacha20poly1305",
- "clap",
- "colored",
- "indicatif",
- "libc",
- "rand",
- "rpassword",
- "tempfile",
- "thiserror",
- "zeroize",
-]
 
 [[package]]
 name = "log"

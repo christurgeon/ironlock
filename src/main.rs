@@ -12,8 +12,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use zeroize::Zeroizing;
 
 use cli::{Cli, Commands};
-use error::{LockboxError, Result};
-use file_ops::{collect_files_recursive, decrypt_file_to_path, encrypt_file, LOCKBOX_EXTENSION};
+use error::{IronlockError, Result};
+use file_ops::{collect_files_recursive, decrypt_file_to_path, encrypt_file, IRONLOCK_EXTENSION};
 use memlock::mlock_slice;
 
 /// Prompt for password input (hidden from terminal)
@@ -22,7 +22,7 @@ fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
     io::stderr().flush()?;
 
     let password =
-        rpassword::read_password().map_err(|e| LockboxError::IoError(io::Error::other(e)))?;
+        rpassword::read_password().map_err(|e| IronlockError::IoError(io::Error::other(e)))?;
 
     // Best-effort mlock to prevent the password from being swapped to disk.
     mlock_slice(password.as_bytes());
@@ -35,13 +35,13 @@ fn prompt_password_with_confirm() -> Result<Zeroizing<String>> {
     let password = prompt_password("Enter password: ")?;
 
     if password.is_empty() {
-        return Err(LockboxError::EmptyPassword);
+        return Err(IronlockError::EmptyPassword);
     }
 
     let confirm = prompt_password("Confirm password: ")?;
 
     if *password != *confirm {
-        return Err(LockboxError::PasswordMismatch);
+        return Err(IronlockError::PasswordMismatch);
     }
 
     Ok(password)
@@ -52,7 +52,7 @@ fn prompt_password_decrypt() -> Result<Zeroizing<String>> {
     let password = prompt_password("Enter password: ")?;
 
     if password.is_empty() {
-        return Err(LockboxError::EmptyPassword);
+        return Err(IronlockError::EmptyPassword);
     }
 
     Ok(password)
@@ -98,7 +98,7 @@ fn count_files(files: &[PathBuf], filter_lb: bool) -> u64 {
                     count += dir_files
                         .iter()
                         .filter(|f| {
-                            f.extension().and_then(|e| e.to_str()) == Some(LOCKBOX_EXTENSION)
+                            f.extension().and_then(|e| e.to_str()) == Some(IRONLOCK_EXTENSION)
                         })
                         .count() as u64;
                 } else {
@@ -157,7 +157,7 @@ impl Counters {
     fn handle_result(
         &mut self,
         prefix: &str,
-        result: std::result::Result<PathBuf, LockboxError>,
+        result: std::result::Result<PathBuf, IronlockError>,
         shred: bool,
     ) {
         let suffix = match &result {
@@ -172,8 +172,8 @@ impl Counters {
                     format!("{} → {}", "✓".green(), output_path.display())
                 }
             }
-            Err(LockboxError::Cancelled) => format!("{}", "skipped".yellow()),
-            Err(LockboxError::DecryptionFailed) => {
+            Err(IronlockError::Cancelled) => format!("{}", "skipped".yellow()),
+            Err(IronlockError::DecryptionFailed) => {
                 format!("{} incorrect password or corrupted file", "✗".red())
             }
             Err(e) => format!("{} {}", "✗".red(), e),
@@ -183,7 +183,7 @@ impl Counters {
 
         match &result {
             Ok(_) => self.success += 1,
-            Err(LockboxError::Cancelled) => self.skipped += 1,
+            Err(IronlockError::Cancelled) => self.skipped += 1,
             Err(_) => self.errors += 1,
         }
 
@@ -193,7 +193,7 @@ impl Counters {
     }
 
     /// Handle a directory-level error
-    fn handle_dir_error(&mut self, e: LockboxError) {
+    fn handle_dir_error(&mut self, e: IronlockError) {
         self.output(&format!("{} {}", "✗".red(), e));
         self.errors += 1;
     }
@@ -239,7 +239,7 @@ fn run() -> Result<()> {
                 eprintln!();
                 encrypt_stdin(password.as_bytes())?;
             } else {
-                println!("{}", "🔐 Lockbox Encryption".cyan().bold());
+                println!("{}", "🔐 Ironlock Encryption".cyan().bold());
                 println!();
 
                 let password = prompt_password_with_confirm()?;
@@ -289,7 +289,7 @@ fn run() -> Result<()> {
                 eprintln!();
                 decrypt_stdin(password.as_bytes())?;
             } else {
-                println!("{}", "🔓 Lockbox Decryption".cyan().bold());
+                println!("{}", "🔓 Ironlock Decryption".cyan().bold());
                 println!();
 
                 let password = prompt_password_decrypt()?;
@@ -310,7 +310,7 @@ fn run() -> Result<()> {
                             Ok(dir_files) => {
                                 for source in dir_files {
                                     if source.extension().and_then(|e| e.to_str())
-                                        != Some(LOCKBOX_EXTENSION)
+                                        != Some(IRONLOCK_EXTENSION)
                                     {
                                         continue;
                                     }
